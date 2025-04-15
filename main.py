@@ -22,6 +22,9 @@ import hashlib
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'  # Required for flashing messages
 
+# Add markdown filter for templates
+app.jinja_env.filters['markdown'] = markdown
+
 load_dotenv()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 GROG_API_KEY = os.getenv("GROG_API_KEY")
@@ -42,7 +45,7 @@ def init_db():
         Column("meta_data", JSONB, server_default=text("'{}'::jsonb")),
         Column("filters", JSONB, server_default=text("'{}'::jsonb"), nullable=True),
         Column("content", Text),
-        Column("embedding", Vector(1536)),
+        Column("embedding", Vector(1024)),
         Column("usage", JSONB),
         Column("created_at", DateTime(timezone=True), server_default=func.now()),
         Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
@@ -71,6 +74,7 @@ def create_agent(pdf_path):
         vector_db=PgVector(
             table_name="pdf_documents",
             db_url=db_url,
+            embedder=MistralEmbedder(),
         ),
         reader=PDFReader(chunk=True),
     )
@@ -247,6 +251,35 @@ def upload_file():
         flash(f'Error processing file: {str(e)}')
         return redirect(url_for('index'))
 
+@app.route('/view_questions', methods=['GET'])
+def view_questions():
+    try:
+        # Connect to the database and fetch all documents with questions
+        engine = create_engine(db_url)
+        questions_data = []
+        
+        with engine.connect() as conn:
+            select_query = text("""
+                SELECT name, usage, content_hash 
+                FROM ai.pdf_documents 
+                WHERE usage->'questions' IS NOT NULL
+                ORDER BY created_at DESC
+            """)
+            result = conn.execute(select_query)
+            
+            for row in result:
+                if row._mapping['usage'] and 'questions' in row._mapping['usage']:
+                    questions_data.append({
+                        'pdf_name': row._mapping['name'],
+                        'questions': row._mapping['usage']['questions'],
+                        'content_hash': row._mapping['content_hash']
+                    })
+        
+        return render_template('view_questions.html', questions_data=questions_data)
+    
+    except Exception as e:
+        flash(f'Error retrieving questions: {str(e)}')
+        return redirect(url_for('index'))
 
 # def save_questions_to_db(questions, file):
 #     if isinstance(questions, str):
