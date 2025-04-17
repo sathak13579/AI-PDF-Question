@@ -72,12 +72,12 @@ init_db()
 
 def create_agent(pdf_path, existing_questions=None):
 
-    storage = SqlAgentStorage(
-        # store sessions in the ai.sessions table
-        table_name="agent_sessions",
-        # db_file: Sqlite database file
-        db_file="tmp/data.db",
-    )
+    # storage = SqlAgentStorage(
+    #     # store sessions in the ai.sessions table
+    #     table_name="agent_sessions",
+    #     # db_file: Sqlite database file
+    #     db_file="tmp/data.db",
+    # )
 
     knowledge_base = PDFKnowledgeBase(
         path=pdf_path,
@@ -118,6 +118,10 @@ def create_agent(pdf_path, existing_questions=None):
         **Answer:** Correct Answer: B
     """)
 
+    if existing_questions:
+        knowledge_base.load_text('These are the questions that you have already generated, Do not generate the same or similar questions: ' + '\n' + existing_questions)
+
+
     knowledge_base.load(recreate=False)
     agent_instructions = [
     "1. You are an AI assistant specializing in creating educational assessment materials.",
@@ -139,6 +143,7 @@ def create_agent(pdf_path, existing_questions=None):
     "17. Do not repeat questions from the existing questions in the storage."
     ]
 
+
     return Agent(
         knowledge=knowledge_base,
         search_knowledge=True,
@@ -146,7 +151,7 @@ def create_agent(pdf_path, existing_questions=None):
         instructions=agent_instructions,
         markdown=True,
         show_tool_calls=True,
-        storage=storage,
+        # storage=storage,
         read_chat_history=True,
         expected_output=expected_output
     )
@@ -250,7 +255,7 @@ def upload_file():
         
         # If no existing questions, create agent and generate new ones
         print(pdf_path)
-        agent = create_agent(pdf_path)
+        agent = create_agent(pdf_path, existing_questions)
         instruction = "Generate  10 Case-Based MCQ questions from the knowledge base. Format them in markdown with proper numbering."
         
         response = agent.run(instruction)
