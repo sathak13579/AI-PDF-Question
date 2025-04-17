@@ -14,10 +14,11 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
 from phi.embedder.mistral import MistralEmbedder
+from phi.storage.agent.sqlite import SqlAgentStorage
 import uuid
 import json
 import hashlib
-
+from textwrap import dedent
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'  # Required for flashing messages
@@ -45,7 +46,8 @@ def init_db():
         Column("meta_data", JSONB, server_default=text("'{}'::jsonb")),
         Column("filters", JSONB, server_default=text("'{}'::jsonb"), nullable=True),
         Column("content", Text),
-        Column("embedding", Vector(1024)),
+        # Column("embedding", Vector(1536)), #Open ai embedding size
+        Column("embedding", Vector(1024)), #Mistral embedding size
         Column("usage", JSONB),
         Column("created_at", DateTime(timezone=True), server_default=func.now()),
         Column("updated_at", DateTime(timezone=True), onupdate=func.now()),
@@ -68,21 +70,56 @@ def init_db():
 # Initialize the database on startup
 init_db()
 
-def create_agent(pdf_path):
+def create_agent(pdf_path, existing_questions=None):
+
+    storage = SqlAgentStorage(
+        # store sessions in the ai.sessions table
+        table_name="agent_sessions",
+        # db_file: Sqlite database file
+        db_file="tmp/data.db",
+    )
+
     knowledge_base = PDFKnowledgeBase(
         path=pdf_path,
         vector_db=PgVector(
             table_name="pdf_documents",
             db_url=db_url,
-            embedder=MistralEmbedder(),
+            embedder=MistralEmbedder(), #uncomment this for open ai and change  embedding size
         ),
         reader=PDFReader(chunk=True),
     )
 
-    knowledge_base.load(recreate=False)
+    expected_output = dedent("""\
+    1.  **Case:** A software development team, following the iterative model described in the document, discovers a major flaw in the core architecture during the third iteration. This flaw impacts features developed in previous iterations.
+        **Question:** According to the principles discussed for handling setbacks in iterative development, what is the most appropriate immediate action for the team?
+        **Options:**
+        A. Continue the current iteration as planned and fix the flaw in a later iteration.
+        B. Halt the current iteration, analyze the flaw's impact, adjust the plan, and potentially revisit previous work before proceeding.
+        C. Discard all previous work and restart the project from the first iteration with a corrected architecture.
+        D. Assign the flaw fixing to a specialized sub-team without altering the main team's iteration plan.
+        **Answer:** Correct Answer: B
 
+    2.  **Case:** The document outlines several project estimation techniques. A project manager needs to estimate the effort for a novel project with many unknown factors and requires input from multiple experts.
+        **Question:** Which estimation technique described in the text would be most suitable for achieving a consensus estimate in this situation?
+        **Options:**
+        A. Analogous Estimating - Using historical data from similar projects.
+        B. Parametric Estimating - Using statistical relationships between historical data and variables.
+        C. Delphi Technique - Iteratively and anonymously collecting expert opinions until consensus emerges.
+        D. Bottom-Up Estimating - Estimating individual work components and summing them up.
+        **Answer:** Correct Answer: C
+
+    3.  **Case:** [Insert another plausible scenario based on the document's content here...]
+        **Question:** [Insert a relevant question applying document concepts to the scenario here...]
+        **Options:**
+        A. [Plausible Option A]
+        B. [Plausible Option B - The Correct Answer]
+        C. [Plausible Option C]
+        D. [Plausible Option D]
+        **Answer:** Correct Answer: B
+    """)
+
+    knowledge_base.load(recreate=False)
     agent_instructions = [
-    # Role Definition
     "1. You are an AI assistant specializing in creating educational assessment materials.",
     "2. You will be provided with text content extracted from a PDF document (referred to as 'the document' or 'the text' internally) as your primary context.",
     "3. Your main objective is to generate meaningful CASE-BASED questions based SOLELY on the provided text content.",
@@ -98,40 +135,45 @@ def create_agent(pdf_path):
     "13. Scenarios, while potentially hypothetical, must be plausible within the context of the document's subject matter.",
     "14. IMPORTANT: Do NOT preface the questions with phrases like 'Based on the lecture notes,', 'According to the text,', 'Using the information provided,', or any similar reference to the source document. The questions should stand alone, assuming the context of the document is implicit.",
     "15. Format the final output as a numbered list using Markdown.", 
-    "16. To generate questions: First, identify key concepts/principles/data in the text. Then, construct a relevant scenario for each. Finally, formulate a question requiring application of the text's concepts to that scenario."
+    "16. To generate questions: First, identify key concepts/principles/data in the text. Then, construct a relevant scenario for each. Finally, formulate a question requiring application of the text's concepts to that scenario.",
+    "17. Do not repeat questions from the existing questions in the storage."
     ]
 
     return Agent(
-        model=MistralChat(id="mistral-large-latest", api_key=MISTRAL_API_KEY),
         knowledge=knowledge_base,
         search_knowledge=True,
         description="This agent can understand the content of a PDF and generate meaningful questions.",
         instructions=agent_instructions,
         markdown=True,
         show_tool_calls=True,
+        storage=storage,
+        read_chat_history=True,
+        expected_output=expected_output
     )
 
 def format_response_html(response):
     """Extract and format the assistant's response for HTML display."""
     try:
         if hasattr(response, "messages") and isinstance(response.messages, list):
-            # ✅ Extract the last assistant message
-            assistant_messages = [msg.content for msg in response.messages if msg.role == "assistant"]
-            formatted_response = "\n\n".join(assistant_messages) if assistant_messages else "⚠️ No assistant response."
-
-            # ✅ Convert Markdown to HTML
+            # Extract only the assistant messages and filter out None values
+            assistant_messages = [
+                msg.content if msg.content is not None else ""
+                for msg in response.messages if msg.role == "assistant"
+            ]
+            formatted_response = "\n\n".join(assistant_messages).strip() or "⚠️ No assistant response."
+            # Convert Markdown to HTML
             formatted_response = markdown(formatted_response)
-
+    
         elif isinstance(response, str):
             formatted_response = markdown(response)  # Convert Markdown to HTML
-
+    
         else:
             formatted_response = "<p>⚠️ Unexpected response format.</p>"
-
+    
         return formatted_response
-
+    
     except Exception as e:
-        return f"<p>⚠️ Error formatting response: {e}</p> <p> {response} </p"
+        return f"<p>⚠️ Error formatting response: {e}</p><p>{response}</p>"
 
 @app.route('/', methods=['GET'])
 def index():
@@ -171,8 +213,9 @@ def upload_file():
         # If it's a list of Document objects, extract the text from the .content attribute.
         if isinstance(document_content, list):
             extracted_text = "\n\n".join(
-                [doc.content for doc in document_content if hasattr(doc, "content") and doc.content]
+                [str(doc.content) if doc.content is not None else "" for doc in document_content if hasattr(doc, "content")]
             )
+
         elif hasattr(document_content, "content"):
             extracted_text = document_content.content
         elif isinstance(document_content, str):
@@ -206,11 +249,9 @@ def upload_file():
         #     return render_template('questions.html', questions=formatted_questions)
         
         # If no existing questions, create agent and generate new ones
+        print(pdf_path)
         agent = create_agent(pdf_path)
-        instruction = "Generate questions from this PDF. Format them in markdown with proper numbering."
-        
-        if existing_questions:
-            instruction += f"\n\nExisting questions: {existing_questions} do not repeat them"
+        instruction = "Generate  10 Case-Based MCQ questions from the knowledge base. Format them in markdown with proper numbering."
         
         response = agent.run(instruction)
         
@@ -219,7 +260,7 @@ def upload_file():
             raw_questions = response
         elif hasattr(response, "messages") and isinstance(response.messages, list):
             raw_questions = "\n\n".join(
-                [msg.content for msg in response.messages if msg.role == "assistant"]
+            [str(msg.content) for msg in response.messages if msg.role == "assistant" and msg.content is not None]
             )
         else:
             raw_questions = str(response)
@@ -305,5 +346,5 @@ def view_questions():
 #         conn.commit()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5001)
 
